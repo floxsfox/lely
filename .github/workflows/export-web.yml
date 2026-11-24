@@ -1,8 +1,7 @@
 name: Export Godot Web
 
-# Taruh file ini di repo pada path: .github/workflows/export-web.yml
-# Lalu upload GlyphLink.zip ke root repo (atau upload isi project-nya langsung).
-# Workflow otomatis meng-unzip, export ke Web, dan deploy ke GitHub Pages.
+# Simpan sebagai: .github/workflows/export-web.yml
+# Upload GlyphLink.zip ke ROOT repo. Workflow meng-unzip, export Web, lalu publish.
 
 on:
   push:
@@ -11,11 +10,9 @@ on:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 concurrency:
-  group: pages
+  group: godot-web
   cancel-in-progress: true
 
 env:
@@ -25,56 +22,106 @@ jobs:
   build:
     name: Build Web
     runs-on: ubuntu-22.04
+    timeout-minutes: 30
     container:
       image: barichello/godot-ci:4.3
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Cari / ekstrak project
+      - name: Cari atau ekstrak project
+        shell: bash {0}
         run: |
-          find_proj() {
-            find . -name project.godot -not -path "./.git/*" -not -path "./build/*" | head -n1
-          }
-          P=$(find_proj)
+          P=$(find . -name project.godot -not -path "./.git/*" -not -path "./build/*" -print -quit)
           if [ -z "$P" ]; then
-            echo "project.godot tidak ditemukan, mencari file .zip ..."
+            echo "project.godot tidak ada, mencari file .zip di root repo..."
+            ls -la
             mkdir -p game_src
-            for z in *.zip; do
-              [ -f "$z" ] && unzip -q -o "$z" -d game_src
+            for z in ./*.zip; do
+              if [ -f "$z" ]; then
+                echo "Ekstrak $z"
+                if command -v unzip >/dev/null 2>&1; then
+                  unzip -q -o "$z" -d game_src
+                else
+                  python3 -c "import sys,zipfile; zipfile.ZipFile(sys.argv[1]).extractall('game_src')" "$z"
+                fi
+              fi
             done
-            P=$(find_proj)
+            P=$(find . -name project.godot -not -path "./.git/*" -not -path "./build/*" -print -quit)
           fi
           if [ -z "$P" ]; then
-            echo "::error::project.godot tidak ketemu. Upload GlyphLink.zip ke root repo."
+            echo "::error title=Project tidak ketemu::Upload GlyphLink.zip ke ROOT repo (jangan di dalam folder)."
             exit 1
           fi
-          PROJ=$(dirname "$P")
+          PROJ=$(cd "$(dirname "$P")" && pwd)
           echo "Project ada di: $PROJ"
+          ls "$PROJ"
           echo "PROJ=$PROJ" >> "$GITHUB_ENV"
 
       - name: Siapkan export templates
+        shell: bash {0}
         run: |
-          mkdir -p ~/.local/share/godot/export_templates
-          SRC=/root/.local/share/godot/export_templates/${GODOT_VERSION}.stable
-          DST=~/.local/share/godot/export_templates/${GODOT_VERSION}.stable
+          mkdir -p "$HOME/.local/share/godot/export_templates"
+          SRC="/root/.local/share/godot/export_templates/${GODOT_VERSION}.stable"
+          DST="$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.stable"
           if [ -d "$SRC" ] && [ ! -d "$DST" ]; then
             cp -r "$SRC" "$DST"
           fi
-          ls ~/.local/share/godot/export_templates/
+          echo "HOME=$HOME"
+          ls "$HOME/.local/share/godot/export_templates/" || true
+          ls /root/.local/share/godot/export_templates/ || true
+          godot --version || true
 
       - name: Import resource
+        shell: bash {0}
         run: |
-          godot --headless --path "$PROJ" --import || true
-          godot --headless --path "$PROJ" --import || true
+          cd "$PROJ"
+          for i in 1 2; do
+            timeout 600 godot --headless --import > "$GITHUB_WORKSPACE/import$i.log" 2>&1
+            echo "import #$i selesai, exit code: $?"
+            tail -n 15 "$GITHUB_WORKSPACE/import$i.log"
+          done
+          ls -la "$PROJ/.godot" || true
+
+      - name: Tes jalan (smoke test, tidak menggagalkan build)
+        continue-on-error: true
+        shell: bash {0}
+        run: |
+          cd "$PROJ"
+          timeout 300 godot --headless --path "$PROJ" -- --smoke > "$GITHUB_WORKSPACE/smoke.log" 2>&1
+          echo "smoke exit code: $?"
+          {
+            echo "### Tes jalan game"
+            echo '```'
+            grep -E "SMOKE|SCRIPT ERROR|Parse Error|Failed to load|ERROR:" "$GITHUB_WORKSPACE/smoke.log" | head -n 60
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if grep -qE "SCRIPT ERROR|Parse Error" "$GITHUB_WORKSPACE/smoke.log"; then
+            echo "::warning title=Ada error script::Lihat Summary / artifact logs"
+          fi
 
       - name: Export Web
+        shell: bash {0}
         run: |
           mkdir -p "$GITHUB_WORKSPACE/build/web"
-          godot --headless --verbose --path "$PROJ" --export-release "Web" "$GITHUB_WORKSPACE/build/web/index.html"
+          cd "$PROJ"
+          godot --headless --verbose --path "$PROJ" --export-release "Web" "$GITHUB_WORKSPACE/build/web/index.html" > "$GITHUB_WORKSPACE/export.log" 2>&1
+          echo "export exit code: $?"
+          tail -n 40 "$GITHUB_WORKSPACE/export.log"
           ls -la "$GITHUB_WORKSPACE/build/web"
-          test -f "$GITHUB_WORKSPACE/build/web/index.html"
-          test -f "$GITHUB_WORKSPACE/build/web/index.pck"
+          if [ ! -f "$GITHUB_WORKSPACE/build/web/index.pck" ] || [ ! -f "$GITHUB_WORKSPACE/build/web/index.html" ]; then
+            echo "::error title=Export gagal::index.pck/index.html tidak terbentuk. Buka artifact 'logs' -> export.log"
+            grep -E "ERROR|Cannot export|No export template" "$GITHUB_WORKSPACE/export.log" | head -n 20
+            exit 1
+          fi
+
+      - name: Simpan log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs
+          path: "*.log"
+          if-no-files-found: ignore
 
       - name: Simpan hasil build
         uses: actions/upload-artifact@v4
@@ -82,26 +129,57 @@ jobs:
           name: web-build
           path: build/web
 
-  deploy:
-    name: Deploy ke GitHub Pages
+  # Cara 1: Settings > Pages > Source = "GitHub Actions"
+  deploy-pages:
+    name: Publish (GitHub Pages - Actions)
     needs: build
     runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - name: Ambil hasil build
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           name: web-build
           path: site
-
-      - name: Upload ke Pages
-        uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v3
         with:
           path: site
+      - id: deployment
+        uses: actions/deploy-pages@v4
 
-      - name: Deploy
-        id: deployment
-        uses: actions/de
-        ploy-pages@v4
+  # Cara 2: Settings > Pages > Source = "Deploy from a branch" > gh-pages / (root)
+  deploy-branch:
+    name: Publish (branch gh-pages)
+    needs: build
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-build
+          path: site
+      - uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./site
+          publish_branch: gh-pages
+          force_orphan: true
+      - name: Petunjuk
+        run: |
+          URL="https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}/"
+          {
+            echo "### Game siap"
+            echo "Link: $URL"
+            echo ""
+            echo "Kalau link belum bisa dibuka: Settings > Pages, pilih salah satu:"
+            echo "- Source: GitHub Actions"
+            echo "- atau Source: Deploy from a branch > gh-pages > / (root)"
+            echo "Repo harus public."
+          } >> "$GITHUB_STEP_SUMMARY"
