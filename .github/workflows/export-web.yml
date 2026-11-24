@@ -1,0 +1,107 @@
+name: Export Godot Web
+
+# Taruh file ini di repo pada path: .github/workflows/export-web.yml
+# Lalu upload GlyphLink.zip ke root repo (atau upload isi project-nya langsung).
+# Workflow otomatis meng-unzip, export ke Web, dan deploy ke GitHub Pages.
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+env:
+  GODOT_VERSION: "4.3"
+
+jobs:
+  build:
+    name: Build Web
+    runs-on: ubuntu-22.04
+    container:
+      image: barichello/godot-ci:4.3
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cari / ekstrak project
+        run: |
+          find_proj() {
+            find . -name project.godot -not -path "./.git/*" -not -path "./build/*" | head -n1
+          }
+          P=$(find_proj)
+          if [ -z "$P" ]; then
+            echo "project.godot tidak ditemukan, mencari file .zip ..."
+            mkdir -p game_src
+            for z in *.zip; do
+              [ -f "$z" ] && unzip -q -o "$z" -d game_src
+            done
+            P=$(find_proj)
+          fi
+          if [ -z "$P" ]; then
+            echo "::error::project.godot tidak ketemu. Upload GlyphLink.zip ke root repo."
+            exit 1
+          fi
+          PROJ=$(dirname "$P")
+          echo "Project ada di: $PROJ"
+          echo "PROJ=$PROJ" >> "$GITHUB_ENV"
+
+      - name: Siapkan export templates
+        run: |
+          mkdir -p ~/.local/share/godot/export_templates
+          SRC=/root/.local/share/godot/export_templates/${GODOT_VERSION}.stable
+          DST=~/.local/share/godot/export_templates/${GODOT_VERSION}.stable
+          if [ -d "$SRC" ] && [ ! -d "$DST" ]; then
+            cp -r "$SRC" "$DST"
+          fi
+          ls ~/.local/share/godot/export_templates/
+
+      - name: Import resource
+        run: |
+          godot --headless --path "$PROJ" --import || true
+          godot --headless --path "$PROJ" --import || true
+
+      - name: Export Web
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/build/web"
+          godot --headless --verbose --path "$PROJ" --export-release "Web" "$GITHUB_WORKSPACE/build/web/index.html"
+          ls -la "$GITHUB_WORKSPACE/build/web"
+          test -f "$GITHUB_WORKSPACE/build/web/index.html"
+          test -f "$GITHUB_WORKSPACE/build/web/index.pck"
+
+      - name: Simpan hasil build
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-build
+          path: build/web
+
+  deploy:
+    name: Deploy ke GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Ambil hasil build
+        uses: actions/download-artifact@v4
+        with:
+          name: web-build
+          path: site
+
+      - name: Upload ke Pages
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - name: Deploy
+        id: deployment
+        uses: actions/de
+        ploy-pages@v4
